@@ -1,0 +1,220 @@
+================================================================================
+PLAN DE MEJORAS — HERMES (Laravel 12 + Inertia + React)
+================================================================================
+Fecha: 2026-09-04
+Carpeta: hermestotal-main/hermes-laravel/
+Basado en: revisión de código (controllers, Support, routes, middleware, tests)
+y en los pendientes de REGISTRO-DE-TRABAJO.txt.
+
+Esfuerzo:  S = horas   M = 1-2 días   L = 1 semana o más
+Prioridad: CRITICA / ALTA / MEDIA / BAJA
+
+--------------------------------------------------------------------------------
+1. SEGURIDAD  (CRITICA — hacer primero)
+--------------------------------------------------------------------------------
+S1. [CRITICA] Rotar credenciales de admin.
+    - Qué:  Las credenciales ACER / LA vienen del dump legacy y están
+            documentadas en el repo. Crear un seeder/env que genere una
+            contraseña fuerte y cambiar la actual.
+    - Dónde: app/Models/AdminUser.php, app/Http/Controllers/Admin/AdminAuthController.php
+    - Esfuerzo: S
+
+S2. [CRITICA] Rate limiting en login (admin y cliente).
+    - Qué:  AdminAuthController::login y AuthController::login no tienen
+            throttle -> fuerza bruta posible. Usar RateLimiter de Laravel
+            (p. ej. 5 intentos/minuto por IP+usuario).
+    - Dónde: app/Http/Controllers/Admin/AdminAuthController.php,
+             app/Http/Controllers/AuthController.php
+    - Esfuerzo: S
+
+S3. [ALTA] Guard contra doble confirmación de envío.
+    - Qué:  Shipment::confirm no verifica si el envío ya tiene codigoenvio:
+            una segunda petición regenera el código, crea otro corresponsal
+            y otra línea en tbl_detalle. Bloquear/ignorar si ya está
+            confirmado (idempotencia).
+    - Dónde: app/Support/Shipment.php (confirm)
+    - Esfuerzo: S
+
+S4. [ALTA] Plan de migración de contraseñas legacy.
+    - Qué:  El formato AES-256-CBC legacy usa una clave hardcodeada
+            ('HERMES' en LegacyPassword::LEGACY_KEY). Mover la clave a env
+            y, en el primer login exitoso con AES, re-hashear a bcrypt.
+            Queda documentado que las claves AES son débiles por diseño.
+    - Dónde: app/Support/LegacyPassword.php
+    - Esfuerzo: M
+
+S5. [ALTA] Validar extensión del archivo subido por el cliente.
+    - Qué:  El nombre de la imagen usa getClientOriginalExtension()
+            (confía en el header del cliente). Validar contra una lista
+            blanca o generar nombre hash con extension derivada del MIME.
+    - Dónde: app/Http/Controllers/Admin/ProductController.php (syncCatalogData)
+    - Esfuerzo: S
+
+S6. [MEDIA] Higiene de secretos del repo legacy.
+    - Qué:  El proyecto viejo (hermestotal_full / hermestotal-main legacy)
+            contiene credenciales de BD en texto plano, claves SSH y
+            passwords hardcodeadas (ver INFORME-MIGRACION-HERMES.txt).
+            No subir ese código a un repo público sin rotar TODO.
+    - Esfuerzo: S (documentación / decisión)
+
+--------------------------------------------------------------------------------
+2. DATOS / ESQUEMA  (ALTA)
+--------------------------------------------------------------------------------
+D1. [ALTA] Migraciones de Laravel (hoy no existen).
+    - Qué:  El esquema vive solo en el dump importado (SQLite espejo).
+            Crear migración base (baseline) de las 49 tablas + migraciones
+            de las 4 tablas creadas a mano (pages, user_page_permissions,
+            tbl_videos, tbl_videos_publicity). Permite php artisan migrate
+            en entornos nuevos y versionar cambios futuros.
+    - Dónde: database/migrations/ (nuevo)
+    - Esfuerzo: L (el baseline es mecánico pero largo)
+
+D2. [ALTA] Base de pruebas determinista.
+    - Qué:  testing.sqlite es una copia del dev DB; los tests comparten
+            estado mutable. Usar transacciones por test (RefreshDatabase con
+            el espejo como base) o limpieza explícita de tablas escritas.
+    - Dónde: tests/TestCase.php, phpunit.xml
+    - Esfuerzo: M
+
+D3. [MEDIA] Seeders oficiales.
+    - Qué:  Crear seeders para datos de referencia (ACER/LA -> seeder con
+            password fuerte, catálogos base) y documentar que los datos de
+            producción vienen del dump.
+    - Esfuerzo: M
+
+--------------------------------------------------------------------------------
+3. LÓGICA DE NEGOCIO  (ALTA)
+--------------------------------------------------------------------------------
+B1. [ALTA] Decrementar stock al confirmar/procesar el pedido.
+    - Qué:  Shipment::confirm no escribe salidas (stipo='S') en
+            tbl_entrada -> se puede vender más stock del disponible.
+            Registrar la salida al confirmar (o en el paso "Procesar"
+            del admin). Validar stock disponible antes de confirmar.
+    - Dónde: app/Support/Shipment.php, app/Support/Checkout.php
+    - Esfuerzo: M
+
+B2. [ALTA] Pago real (PayPal y/o transferencia confirmada).
+    - Qué:  Hoy el checkout pide banco+número de cuenta y guarda el dato
+            sin verificación; no hay cobro. Definir flujo: PayPal (SDK,
+            código de referencia en hermestotal_full/server.js) o
+            transferencia con confirmación manual del admin. Mapear
+            estados en tbl_rastreo.
+    - Dónde: app/Http/Controllers/ShipmentController.php,
+             app/Http/Controllers/Admin/ShipmentController.php
+    - Esfuerzo: L
+
+B3. [ALTA] Recuperar contraseña por email.
+    - Qué:  Falta el flujo de reset (legacy register/recovery.php).
+            Requiere configurar SMTP (config/mail.php, .env) + tabla
+            password_reset_tokens + página de reset.
+    - Dónde: app/Http/Controllers/AuthController.php (nuevo método)
+    - Esfuerzo: M
+
+B4. [MEDIA] CRUD de pedidos tbl_master/tbl_detalle en el admin.
+    - Qué:  Hoy la gestión de pedidos con envío es /admin/envios; los
+            pedidos de carrito (tbl_master/tbl_detalle) no tienen panel.
+            Añadir vista de pedidos + detalle + estados.
+    - Dónde: app/Http/Controllers/Admin/ (nuevo OrderController)
+    - Esfuerzo: M
+
+--------------------------------------------------------------------------------
+4. FUNCIONALIDADES PENDIENTES DEL CHECKLIST DE MIGRACIÓN  (MEDIA)
+--------------------------------------------------------------------------------
+F1. [MEDIA] Menú lateral de categorías + menu_items en la tienda.
+    - Qué:  El CRUD de menu_items ya existe en admin; falta mostrarlo
+            como menú lateral en el storefront.
+    - Dónde: resources/js/components/, routes/web.php
+    - Esfuerzo: M
+
+F2. [MEDIA] UI admin para slides/banners (tbl_images_slide_pub).
+    - Qué:  Hoy los slides se administran por archivos en la carpeta
+            legacy image_sitio/. Crear CRUD con subida.
+    - Dónde: app/Http/Controllers/Admin/CatalogController.php o nuevo
+    - Esfuerzo: M
+
+F3. [MEDIA] Reportes/gráficos (legacy graficos/).
+    - Qué:  Dashboard con ventas por período, productos top, etc.
+    - Esfuerzo: L
+
+F4. [BAJA] API HeroApi / apps Android-Desktop.
+    - Qué:  Documentar si se migra la API JSON (api/rastreo_*.php) para
+            la app Android; DesktopApp (Java) queda fuera de alcance web.
+    - Esfuerzo: L (si se decide migrar)
+
+--------------------------------------------------------------------------------
+5. CALIDAD DE CÓDIGO  (MEDIA)
+--------------------------------------------------------------------------------
+C1. [MEDIA] Eliminar duplicación de precio/stock.
+    - Qué:  La lógica de precio vigente (tbl_venta CV='V' cestado=1) y
+            stock (tbl_entrada E-S) está en Catalog::baseQuery y repetida
+            3 veces en Admin/ProductController. Extraer a un servicio/
+            presenter único.
+    - Dónde: app/Support/Catalog.php, app/Http/Controllers/Admin/ProductController.php
+    - Esfuerzo: S
+
+C2. [MEDIA] Route model binding + policies para envíos.
+    - Qué:  Las rutas reciben {tracking} como int y cada controller hace
+            findOrFail + chequeo manual de propiedad. Usar binding y una
+            Policy (TrackedShipmentPolicy) para centralizar el 403.
+    - Dónde: routes/web.php, app/Policies/ (nuevo)
+    - Esfuerzo: M
+
+C3. [MEDIA] Migrar a guards de auth de Laravel.
+    - Qué:  AuthSession/AdminSession son wrappers de sesión propios.
+            Migrar a guards (cliente sobre `register`, admin sobre
+            tbl_usuario) para obtener throttle, remember-me y reset
+            gratis. Hacer después de S2.
+    - Dónde: app/Support/AuthSession.php, app/Support/AdminSession.php,
+             config/auth.php
+    - Esfuerzo: L
+
+C4. [BAJA] Queries duplicadas en ShipmentController (Tracking::findOrFail
+    inline en destination/confirmPage/confirm/show) -> centralizar en
+    app/Support/Shipment.php.
+    - Esfuerzo: S
+
+--------------------------------------------------------------------------------
+6. PRUEBAS  (MEDIA)
+--------------------------------------------------------------------------------
+T1. [ALTA] Tests de seguridad:
+    - 403 en envíos ajenos (ya existe el check, falta el test).
+    - Doble confirmación de envío (no debe duplicar corresponsal/detalle).
+    - Rate limiting en login admin y cliente.
+    - Subida de imagen con extensión no permitida.
+    Esfuerzo: M
+
+T2. [MEDIA] Tests de stock: confirmar pedido debe restar stock; sin stock
+    no se puede confirmar (cuando exista B1).
+    Esfuerzo: S
+
+T3. [MEDIA] Cobertura del flujo admin: avanzar envío (procesar -> courier ->
+    entregado), CRUD productos con subida de imagen.
+    Esfuerzo: M
+
+--------------------------------------------------------------------------------
+7. OPERACIONES / DESPLIEGUE  (MEDIA)
+--------------------------------------------------------------------------------
+O1. [MEDIA] Configuración de producción en .env:
+    - SESSION_SECURE_COOKIE=true, APP_ENV=production, APP_DEBUG=false,
+      DB_CONNECTION=mysql con credenciales fuertes, MAIL_* para SMTP.
+    - No commitear .env (verificar .gitignore).
+    Esfuerzo: S
+
+O2. [MEDIA] Mover imágenes de public/uploads a storage + disco público
+    (storage:link) en producción.
+    Esfuerzo: M
+
+O3. [BAJA] Dockerfile / documentación de despliegue (PHP 8.2+, MySQL,
+    npm run build) para reproducir el entorno en cualquier máquina.
+    Esfuerzo: M
+
+--------------------------------------------------------------------------------
+ORDEN SUGERIDO DE EJECUCIÓN
+--------------------------------------------------------------------------------
+1. S3 doble confirmación + S2 rate limiting        (S, alto valor, seguro)
+2. S1 rotar admin + S5 extensión de archivo        (S)
+3. B1 stock y D2 tests deterministas               (M)
+4. D1 migraciones + S4 contraseñas legacy          (M-L)
+5. B2 pago real + B3 recuperar contraseña          (L)
+6. Resto (F1-F4, C1-C4, T1-T3, O1-O3)              (progresivo)
+================================================================================

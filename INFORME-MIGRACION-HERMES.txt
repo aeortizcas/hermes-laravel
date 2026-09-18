@@ -1,0 +1,284 @@
+================================================================================
+INFORME DEL PROYECTO: MIGRACIÓN DE "HERMES" (PHP LEGACY) A LARAVEL 12 + REACT
+================================================================================
+Fecha: 2026-09-04
+Carpeta del proyecto nuevo: hermestotal-main/hermes-laravel/
+Carpeta del código legacy (referencia, sin tocar): hermestotal-main/hermestotal-main/
+
+--------------------------------------------------------------------------------
+1. OBJETIVO
+--------------------------------------------------------------------------------
+Migrar la tienda en línea del monolito PHP legacy a un stack moderno:
+Laravel 12 (backend) + Inertia.js + React (frontend), reutilizando el esquema
+MySQL existente (49 tablas, dump db_drcr-3_6_jul_2025.sql) para no perder
+compatibilidad con los datos de producción.
+
+Alcance de la FASE 1 (acordado con el usuario): flujo comercial público de
+punta a punta:
+  - Portada / catálogo con búsqueda
+  - Filtrado por categoría de producto
+  - Ficha de producto con galería de imágenes
+  - Carrito (sesión) con cantidades
+  - Checkout que guarda el pedido en las tablas legacy (tbl_master/tbl_detalle)
+
+Fuera de fase 1 (próximas fases): autenticación/login, pago (PayPal),
+administración de productos, seguimiento de envíos, facturación y reportes,
+migración de esos mismos módulos en el admin.
+
+--------------------------------------------------------------------------------
+2. QUÉ ES EL SISTEMA LEGACY (resumen del análisis)
+--------------------------------------------------------------------------------
+- Nombre interno: Hermes (repo "hermesfull"), BD "db_drcr".
+- ~423 archivos PHP (~44.5k líneas), 49 tablas MySQL, PHP procedural sin
+  framework, mezcla mysqli/PDO, HTML/PHP con CSS/JS inline, jQuery/Bootstrap/
+  DataTables/FPDF copiados a mano, fragmentos de Vue 2.
+- Módulos principales: storefront (index2.php, show1.php, insert.php…),
+  carrito/pedidos basado en tablas (tbl_master/tbl_detalle/tbl_venta),
+  seguimiento de envíos (seguimiento_envio*.php, tbl_rastreo, tbl_tracking*),
+  facturación (factura/, reports/ con FPDF), CRUDs administrativos duplicados
+  (país/departamento/ciudad/proveedores/unidades/peso/…), contenido (videos,
+  slideshows, suscripciones), API para app Android (HeroApi/), app de
+  escritorio Java Swing (DesktopApp/).
+- Riesgos detectados (documentados, no corregidos en legacy): credenciales de
+  BD de producción en texto plano (db.php, controller/db.php, HeroApi/db.php),
+  claves SSH en la raíz (Uchihamadara001, *.pub, authorized_keys…), passwords
+  hardcodeadas (factura/helloworld.php…), SQL por interpolación (queries.php),
+  subidas de archivo sin validación fuerte. Importante: rotar credenciales si
+  el repo llegara a ser público.
+- Peculiaridades del esquema que condicionan la migración:
+  * El PRECIO de un producto NO está en tbl_producto: vive en tbl_venta
+    (filas CV='V' y cestado=1; se toma la más reciente como "precio vigente").
+  * El STOCK se calcula con tbl_entrada (stipo 'E' entradas − 'S' salidas,
+    nestado=1). Hay además tbl_unidades_restantes (vacía, no usada).
+  * El carrito/pedido legacy = filas en tbl_master (cabecera: cestado=1,
+    sbi=0) + tbl_detalle (líneas: cestado=1, Y=1).
+  * register es la tabla de clientes/usuarios (name, email, password con
+    mezcla de bcrypt y cifrado AES legacy).
+  * Categorías de producto: tbl_categories (el producto referencia por
+    tbl_producto.idec). La tabla `categories` era solo menú.
+
+--------------------------------------------------------------------------------
+3. DECISIONES DE ARQUITECTURA (tomadas con el usuario)
+--------------------------------------------------------------------------------
+1) Alcance fase 1: "Storefront core" (catálogo → producto → carrito → checkout).
+2) Arquitectura: Laravel + Inertia.js + React (una sola app, sin API separada).
+3) Base de datos: "Reuse schema as-is" (mismos nombres de tablas/columnas).
+4) Entorno: instalar PHP/Composer/MySQL para correr localmente.
+
+CAMBIO DE ENTORNO (importante): este Mac es macOS 12.7.6 (Monterey, Intel).
+Homebrew 6.x ya no publica bottles para macOS 12 → compilar php@8.3/aspell/etc.
+desde fuente requería 1-2 h y los procesos de brew morían en modo no interactivo.
+MySQL tampoco publica binarios para macOS 12 (404 en cdn.mysql.com).
+SOLUCIÓN ADOPTADA (equivalente a la intención del usuario):
+  - PHP 8.3.33 estático autónomo compilado con static-php-cli (spc).
+  - Desarrollo local sobre SQLite que ES UN ESPEJO del esquema MySQL original
+    (convertido con hermes-laravel/scripts/convert_dump.py desde el dump).
+  - La app está lista para MySQL en producción: solo cambiar .env
+    (DB_CONNECTION=mysql, DB_DATABASE=db_drcr, usuario/contraseña) y apuntar
+    al dump original; los modelos/consultas son portables (Eloquent).
+    SQLite de desarrollo: database/database.sqlite (49 tablas, integridad ok).
+    SQLite de pruebas:  database/testing.sqlite (copia para phpunit).
+
+--------------------------------------------------------------------------------
+4. ENTORNO LOCAL (qué se instaló y dónde)
+--------------------------------------------------------------------------------
+- /tmp/spc/buildroot/bin/php ......... PHP 8.3.33 (CLI estático, clang 14).
+  Extensiones: ctype, curl, dom, fileinfo, filter, hash, iconv, json, mbstring,
+  openssl, pcntl, Phar, pdo_sqlite, posix, session, simplexml, sqlite3,
+  tokenizer, xml, xmlwriter (+ pdo).
+  Nota: mbstring se compiló SIN mbregex (limitación de spc). Como Laravel usa
+  mb_split (Str::studly/snake), se añadió un polyfill autocargado:
+  app/Support/mb_polyfill.php (solo define mb_split si no existe; inofensivo en
+  PHP normal con mbregex).
+- /tmp/hermes-tools/composer ......... Composer 2.10.3 (phar).
+- autoconf 2.71 instalado en /usr/local (necesario para buildconf de php-src;
+  no quedó brew corriendo).
+- Node 24 / npm 11 ya estaban instalados. Caché npm raíz corrupta con ficheros
+  root: se usa caché alternativa (npm install --cache /tmp/npm-cache).
+- NO se instaló MySQL local (inviable en este macOS en tiempo razonable).
+
+Comandos útiles de este entorno:
+  export PATH=/tmp/spc/buildroot/bin:$PATH
+  php -v                                # PHP 8.3.33
+  php /tmp/hermes-tools/composer ...    # composer
+
+--------------------------------------------------------------------------------
+5. LA NUEVA APP: ESTRUCTURA (hermestotal-main/hermes-laravel/)
+--------------------------------------------------------------------------------
+  .env / .env.example         SQLite por defecto; comentarios para MySQL prod
+  artisan                     entrada CLI (Laravel 12)
+  bootstrap/app.php           configuración Laravel 12 + middleware Inertia
+  bootstrap/providers.php
+  composer.json / package.json
+  vite.config.js              laravel-vite-plugin + @vitejs/plugin-react
+  config/*                    app, auth, cache, database, filesystems, hashing,
+                              logging, mail, queue, services, session, view
+  routes/web.php              rutas de la tienda (Inertia)
+  routes/console.php
+  database/database.sqlite    espejo SQLite del dump (49 tablas)
+  database/testing.sqlite     copia para tests
+  public/index.php
+  public/uploads/products/*   imágenes de producto (copiadas del legacy)
+  public/uploads/slides/*     imágenes del slideshow (copiadas del legacy)
+  app/Models/                 modelos Eloquent sobre tablas legacy
+  app/Support/Catalog.php     consultas de catálogo (precio + stock)
+  app/Support/Cart.php        carrito por sesión
+  app/Support/Checkout.php    persiste el pedido en tablas legacy
+  app/Support/mb_polyfill.php polyfill mb_split (entornos sin mbregex)
+  app/Http/Controllers/       Home, Category, Product, Cart, Checkout
+  app/Http/Middleware/HandleInertiaRequests.php
+  resources/views/app.blade.php          raíz Inertia
+  resources/js/app.jsx                   bootstrap React
+  resources/js/pages/*.jsx               Home, Category, Product, Cart,
+                                         Checkout/index, Checkout/Complete
+  resources/js/components/*.jsx          Layout, CategoryNav, ProductCard,
+                                         ProductGrid, format.js
+  resources/js/css/app.css               estilos de la tienda
+  tests/Feature/StorefrontTest.php       pruebas de humo
+  scripts/convert_dump.py                conversor dump MySQL → SQLite
+  INFORME-MIGRACION-HERMES.txt           este documento
+
+--------------------------------------------------------------------------------
+6. MAPEO ESQUEMA LEGACY → MODELOS / CÓDIGO
+--------------------------------------------------------------------------------
+  Tabla legacy          Modelo Eloquent (App\Models)
+  --------------------  ----------------------------------------------
+  tbl_producto          Product
+  tbl_producto_imagenes ProductImage (portada/cEstado, url => /uploads/products)
+  tbl_categories        ProductCategory (el producto enlaza por idec)
+  tbl_venta             Sale (precio; active = CV='V' y cestado=1)
+  tbl_entrada           InventoryEntry (stipo E/S, nestado)
+  tbl_master            OrderMaster (cestado=1 + sbi=0 => abierto)
+  tbl_detalle           OrderDetail (cestado=1 + Y=1 => línea activa)
+  register              User (clientes)
+  images                Slide (slideshow de portada)
+  tbl_main_menu         MainMenu   (no usado aún en UI)
+  tbl_submenu           Submenu    (no usado aún en UI)
+
+Reglas replicadas (con consultas limpias; el legacy usaba joins que
+multiplicaban filas y daban números erróneos):
+  - Precio vigente = fila más reciente de tbl_venta con CV='V', cestado=1
+    por producto (subconsulta ORDER BY idventa DESC LIMIT 1).
+  - Stock/unidades restantes = SUM(ncantidad) stipo='E' − SUM(ncantidad)
+    stipo='S' (nestado=1). Si <= 0 => producto AGOTADO.
+  - Solo se muestran productos con precio vigente Y con imagen de portada
+    (equivalente a los INNER JOIN del legacy).
+  - IVA 15 %: carrito/checkout muestran subtotal, IVA y total; el total
+    coincide con el cálculo legacy (subtotal * 1.15).
+
+Desviaciones deliberadas (documentadas):
+  - El carrito ahora vive en la SESIÓN del navegador (antes: filas sueltas en
+    tbl_master/tbl_detalle por cada click). Es más limpio y permite guest.
+  - Al confirmar el pedido (checkout) se persiste 1 cabecera (tbl_master:
+    dfecha=Hoy, idusuario=cliente, cestado=1, sbi=0) + 1 línea por producto
+    (tbl_detalle: cestado=1, Y=1) + 1 fila histórica de precio (tbl_venta con
+    cestado=0, para NO alterar el precio de catálogo que usa cestado=1).
+  - El cliente se busca/crea en register por email (los passwords legacy son
+    una mezcla de bcrypt y AES: la autenticación completa llega en fase 2).
+  - Sin pago real en fase 1: el pedido queda "pendiente" y la pantalla de
+    confirmación lo indica; PayPal/transferencia = fase 2.
+
+--------------------------------------------------------------------------------
+7. VERIFICACIÓN REALIZADA
+--------------------------------------------------------------------------------
+- composer install .............. OK (107 paquetes, package:discover OK).
+- php artisan key:generate ...... OK (APP_KEY en .env).
+- php artisan route:list ........ 9 rutas de la tienda visibles.
+- npm install + npm run build ... OK (Vite compila app.jsx + páginas, 3.31 s).
+- php vendor/bin/phpunit ........ 5/5 tests OK (14 aserciones):
+    * Home lista productos reales (contiene "Pildora" del dump).
+    * /producto/1 responde 200 y muestra el producto.
+    * /categorias/1 filtra por categoría.
+    * Flujo de carrito: agregar producto y verlo en /carrito.
+    * Checkout: crea filas reales en tbl_master y tbl_detalle con los flags
+      legacy (cestado=1, sbi=0, Y=1) y guarda el cliente.
+- Smoke test con servidor real (php artisan serve, puerto 8000):
+    200  /            200  /producto/1    200  /producto/8
+    200  /categorias/1 200  /carrito       302  /checkout (vacío ⇒ redirige)
+    200  /up  (health check)
+- El HTML de / contiene los datos reales serializados (data-page) y los assets
+  compilados de Vite (public/build).
+
+--------------------------------------------------------------------------------
+8. CÓMO EJECUTARLO
+--------------------------------------------------------------------------------
+Requisitos normales (máquina con PHP >= 8.2, Composer, Node >= 20):
+  cd hermestotal-main/hermes-laravel
+  composer install
+  npm install
+  cp .env.example .env && php artisan key:generate   (si no existe .env)
+  # Base de datos:
+  #   - Local dev sin MySQL: ya está database/database.sqlite (espejo del dump).
+  #     Para regenerarlo desde el dump original:
+  #       python3 scripts/convert_dump.py ../hermestotal-main/db_drcr-3_6_jul_2025.sql database/database.sqlite
+  #   - Producción/MySQL real: editar .env (DB_CONNECTION=mysql, DB_HOST,
+  #     DB_PORT, DB_DATABASE=db_drcr, DB_USERNAME, DB_PASSWORD) e importar el
+  #     dump original en MySQL.
+  npm run build        # compila el frontend (o "npm run dev" para desarrollo)
+  php artisan serve    # servidor en http://127.0.0.1:8000
+
+En ESTA máquina (PHP estático, sin MySQL):
+  export PATH=/tmp/spc/buildroot/bin:$PATH
+  cd hermestotal-main/hermes-laravel
+  php artisan serve
+  npm run build   (ya compilado)
+
+Pruebas:
+  php vendor/bin/phpunit
+  # copia la BD de dev a testing si hace falta:
+  cp database/database.sqlite database/testing.sqlite
+
+--------------------------------------------------------------------------------
+9. PENDIENTE / PRÓXIMAS FASES (sugerencias)
+--------------------------------------------------------------------------------
+Fase 2 — Pagos y pedidos:
+  - Integrar PayPal (el repo legacy ya tiene client-id y un server Node de
+    referencia en src/ + server.js) y/o transferencia bancaria.
+  - Estados de pedido + panel de "mis pedidos" (tbl_rastreo / seguimiento).
+Fase 2 — Autenticación:
+  - Login/registro sobre register (manejar hashes bcrypt nuevos; los AES
+    legacy no son verificables con password_verify: decidir migración).
+Fase 3 — Admin (Laravel + React):
+  - CRUD productos/precios/categorías/imágenes (escribir tbl_venta con
+    cestado=1 para fijar precio, tbl_entrada E/S para stock).
+  - Gestión de pedidos recibidos.
+Fase 4 — Módulos restantes:
+  - Seguimiento de envíos (tbl_tracking*, tbl_rastreo), facturación (reportes),
+    contenido (videos/slides/suscripciones), usuarios.
+Higiene:
+  - Mover imágenes de public/uploads a storage + disco público en producción.
+  - Migraciones/seeders oficiales de Laravel (hoy el esquema lo aporta el
+    dump importado; documentar).
+  - Limpieza de secretos del repo legacy (credenciales, claves SSH) y rotación.
+
+--------------------------------------------------------------------------------
+10. LOG RESUMIDO DE LO EJECUTADO (cronología)
+--------------------------------------------------------------------------------
+1. Análisis del zip: inventario, arquitectura, esquema, seguridad.
+2. Pruebas de entorno: sin PHP/Composer/MySQL; Node 24; Homebrew en macOS 12.
+3. Intentos Homebrew (php@8.3 + composer + mysql): sin bottles para macOS 12,
+   compilaciones desde fuente; procesos no interactivos morían -> descartado.
+4. Alternativas MySQL (bottles, tarballs cdn.mysql.com, mirror Huawei,
+   MariaDB): inviables para macOS 12 -> SQLite espejo + config MySQL prod.
+5. Converter dump→SQLite (Python) iterado hasta 49 tablas + integridad ok.
+   Aprendizajes del dump: ALTER TABLE ADD PRIMARY KEY/MODIFY/FOREIGN KEY
+   separados, ENUM, ON UPDATE, AUTO_INCREMENT, sin blobs binarios.
+6. Imágenes referenciadas por la BD copiadas a public/uploads (23 productos,
+   4 slides) desde Pro/uploads/ e images/ del legacy.
+7. Build PHP estático con static-php-cli 2.8.5:
+   - spc descarga fuentes (php-src 8.3, openssl, curl, sqlite, libxml…).
+   - pkg-config => symlink a pkgconf.
+   - autoconf 2.71 compilado/instalado en /usr/local.
+   - Varios builds hasta incluir filter/phar/… y oniguruma como librería.
+   - Resultado: /tmp/spc/buildroot/bin/php (PHP 8.3.33 CLI estático).
+8. Composer 2.10.3 (phar) instalado en /tmp/hermes-tools.
+9. Laravel 12 scaffold manual completo (configs, bootstrap, rutas, .env).
+10. Modelos Eloquent (11) sobre tablas legacy; servicios Catalog/Cart/Checkout.
+11. Controladores Inertia + middleware HandleInertiaRequests.
+12. Frontend React: Layout, páginas Home/Category/Product/Cart/Checkout/
+    Complete, CSS propio.
+13. npm install (con caché alternativa /tmp/npm-cache por permisos) + build OK.
+14. phpunit.xml + tests de humo; iteraciones: polyfill mb_split, $guarded en
+    User, agregados en detalle de producto (404 corregido), asserts correctos.
+15. Verificación final: 5/5 tests + smoke HTTP 200/302 + health /up.
+================================================================================
